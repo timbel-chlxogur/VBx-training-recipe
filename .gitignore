@@ -1,1 +1,9 @@
 *.pyc
+data
+mfcc
+RIRS_NOISES
+fbank
+exp
+backup
+lists
+rirs_noises.zip

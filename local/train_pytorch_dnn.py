@@ -15,9 +15,37 @@ import time
 import math
 
 import torch
+import tempfile, subprocess
+import numpy as np
+import kaldiio
+from torch.utils.data import Dataset
 
 import torch.nn as nn
-import horovod.torch as hvd
+# import horovod.torch as hvd
+from torch.utils.tensorboard import SummaryWriter
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+
+try:
+    import horovod.torch as hvd          # Horovod가 있으면 그대로 사용
+    HOROVOD = True
+except (ImportError, OSError):           # ImportError·CUDA 심볼 오류 모두 잡기
+    HOROVOD = False
+
+    class _DummyHvd:
+        # 필수 API만 구현 — 모두 단일-GPU용 no-op
+        def init(self): pass
+        def shutdown(self): pass
+        def rank(self): return 0
+        def size(self): return 1
+        def local_rank(self): return 0
+        class Compression:
+            none = None
+            fp16 = None
+        def DistributedOptimizer(self, opt, **kw):   # 그냥 원본 Optimizer 반환
+            return opt
+        def broadcast_parameters(self, *a, **k): pass
+        def broadcast_optimizer_state(self, *a, **k): pass
+    hvd = _DummyHvd()
 
 from utils.pytorch_data import KaldiArkDataset
 from utils import ze_utils
@@ -144,6 +172,13 @@ def get_args():
     
     parser.add_argument('--squeeze-excitation', default=False, action='store_true',
                         help='use squeeze excitation layers')
+    
+    parser.add_argument("--val-egs-dir", type=str, default=None,
+                    help="Directory of validation egs. If not set, "
+                         "train_egs_dir/train_diagnostic_egs.*.ark is used.")
+    
+    parser.add_argument("--trials-path", type=str, default=None,
+                    help="eer 출력을 위한 trials txt파일. utils/make_cosine_trials.py 로 생성 가능.")
 
     args = parser.parse_args()
 
@@ -188,14 +223,14 @@ def process_args(args):
 
 
 def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, criterion,
-                        device, log_interval, len_train_sampler):
+                        device, log_interval, len_train_sampler, writer):
     """ Called from train for one iteration of neural network training
 
     Selected args:
         shrinkage_value: If value is 1.0, no shrinkage is done; otherwise
             parameter values are scaled by this value.
     """
-
+    
     iter_loss = 0
     num_correct = 0
     num_total = 0
@@ -242,6 +277,26 @@ def train_one_iteration(args, main_dir, _iter, model, data_loader, optimizer, cr
             num_correct += predict.eq(target).sum().item()
             num_total += len(data)
             total_gpu_waiting += time.time() - gpu_waiting
+            if writer is not None and hvd.rank() == 0:
+                writer.add_scalar('Loss/train', iter_loss, _iter)
+                writer.add_scalar('Accuracy/train', num_correct * 1.0 / num_total, _iter)
+                global_step = _iter   # 전체 iter 인덱스
+
+                # ① 현재 lr 가져오기 (Scheduler 사용 여부에 따라)
+                current_lr = optimizer.param_groups[0]['lr']
+
+                writer.add_scalar('lr', current_lr, global_step)
+
+                # ② weight-decay 항 계산: λ × ‖W‖₂
+                wd = optimizer.param_groups[0].get('weight_decay', 0.0)
+                if wd > 0:
+                    weight_norm = 0.0
+                    for group in optimizer.param_groups:
+                        for p in group['params']:
+                            if p.grad is None:
+                                continue
+                            weight_norm += p.data.norm(2).item()
+                    writer.add_scalar('weight_decay|w|', wd * weight_norm, global_step)
             if batch_idx > 0 and batch_idx % log_interval == 0 and hvd.rank() == 0:
                 # use train_sampler to determine the number of examples in this worker's partition.
                 logger.info(f'Train Iter: {_iter} [{batch_idx * len(data)}/{len_train_sampler} '
@@ -329,7 +384,221 @@ def eval_network(model, data_loader, device):
                 ((time.time() - start_time) / 60.0))
     logger.info("GPU waiting for processing whole training minibatches is %.2f minutes." %
                 (total_gpu_waiting / 60.0))
+    
+def eval_once(model, loader, device, criterion):
+    model.eval()
+    tot_loss, tot_corr, tot = 0.0, 0, 0
+    with torch.no_grad():
+        for batch_idx, (x, y) in enumerate(loader):
+            x, y = x.to(device), y.long().to(device)
+            x = x.transpose(1, 2)
+            # out = model.metric(model(x), y) if args.metric != 'linear' else model.metric(model(x))
+            
+            # pred = model(x.to(device))
+            # ── forward ───────────────────────────────────────────
+            logits = model(x)                 # 원-로짓
+            out    = (model.metric(logits, y)    # margin 층 포함
+                      if args.metric != 'linear'
+                      else model.metric(logits))
+            # ──────────────────────────────────────────────────────
 
+            # ── 디버그 출력 : 첫 배치만 ───────────────────────────
+            if batch_idx == 0:
+                print("model out dim :", logits.shape[1])
+                print("label max/min :", y.min().item(), "/", y.max().item())
+                print("top-1 preds   :", logits.argmax(1)[:20].cpu().tolist())
+                print("labels sample :", y[:20].cpu().tolist())
+            # ──────────────────────────────────────────────────────
+            
+            loss = criterion(out, y).item()
+            tot_loss += loss
+            tot_corr += out.argmax(1).eq(y).sum().item()
+            tot += y.numel()
+    return tot_loss / len(loader), tot_corr / tot
+
+# ─────────────────────────────────────────────────────────
+# eval_cosine.py  (train_pytorch_dnn.py 내부 혹은 utils)
+# ─────────────────────────────────────────────────────────
+
+class FeatsScpDataset(Dataset):
+    def __init__(self, feats_scp, cmn=True):
+        self.entries = [line.strip().split()           # [utt, ark:pos]
+                        for line in open(feats_scp)]
+        self.cmn = cmn
+
+    def __len__(self):
+        return len(self.entries)
+
+    def __getitem__(self, idx):
+        utt, ark_pos = self.entries[idx]
+        mat = kaldiio.load_mat(ark_pos)               # (T, F)
+        if self.cmn:
+            mat -= np.mean(mat, axis=0, keepdims=True)
+        return torch.tensor(mat, dtype=torch.float32), utt
+    
+CHUNK = 400                 # 한 세그먼트 길이(프레임)
+
+def collate_fixed(batch):
+    """
+    batch : List[(feat(T,F) Tensor,  utt_id str)]
+    반환  : (B, CHUNK, F) Tensor,  List[str]
+    • T ≥ CHUNK → 앞쪽 400프레임 사용
+    • T < CHUNK → 반복 padding 으로 400프레임 채움
+    """
+    feats, utts = zip(*batch)
+    fixed = []
+    for m in feats:                      # m : Tensor (T, F)
+        t = m.size(0)
+        if t >= CHUNK:
+            fixed.append(m[:CHUNK].clone())          # Tensor 깊은 복사
+        else:
+            reps = (CHUNK + t - 1) // t              # ceil(CHUNK / t)
+            pad  = m.repeat(reps, 1)[:CHUNK].clone() # 반복 뒤 슬라이스
+            fixed.append(pad)
+    return torch.stack(fixed), list(utts)
+    
+def _cosine_score(e1: np.ndarray, e2: np.ndarray) -> float:
+    """코사인 유사도 스코어"""
+    return float(np.dot(e1, e2) /
+                 (np.linalg.norm(e1) * np.linalg.norm(e2) + 1e-8))
+
+def _write_scores_labels(scores, labels):
+    """
+    Kaldi compute-eer / compute_min_dcf.py 가 요구하는 형식:
+        <score> <target|nontarget>
+    """
+    tmp = tempfile.NamedTemporaryFile(mode="w+", delete=False)
+    for s, l in zip(scores, labels):
+        tag = "target" if l == 1 else "nontarget"
+        tmp.write(f"{s:.6f} {tag}\n")
+    tmp.flush()
+    return tmp
+
+def _kaldi_compute_eer(score_file):
+    """compute-eer 바이너리 호출 → EER(float 0~1) 반환"""
+    out = subprocess.check_output(["compute-eer", score_file.name], text=True)
+    # "Equal error rate is  6.27%" 형식
+    eer = float(out.strip().split()[-1].rstrip('%')) / 100.0
+    return eer
+
+def _write_score_and_label_files(scores, labels):
+    tmp_scores = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+    tmp_labels = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+
+    for s, l in zip(scores, labels):
+        tmp_scores.write(f'{s:.6f}\n')
+        tmp_labels.write('target\n' if l == 1 else 'nontarget\n')
+
+    tmp_scores.flush(); tmp_labels.flush()
+    return tmp_scores, tmp_labels
+
+def _write_scores_and_trials(trials, scores):
+    # trials  = [(utt1, utt2, label)], label∈{0,1}
+    # scores  = [float, ...]  (matched 길이)
+    tmp_score = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+    tmp_trial = tempfile.NamedTemporaryFile(mode='w+', delete=False)
+
+    for (u1, u2, lab), s in zip(trials, scores):
+        tag = 'target' if lab == 1 else 'nontarget'
+        tmp_score.write(f'{u1} {u2} {s:.6f}\n')
+        tmp_trial.write(f'{u1} {u2} {tag}\n')
+
+    tmp_score.flush(); tmp_trial.flush()
+    return tmp_score, tmp_trial
+
+def _kaldi_compute_min_dcf(trials, scores, p_target=0.01):
+    scr_f, tri_f = _write_scores_and_trials(trials, scores)
+    DCF_SCRIPT = os.path.join(
+        os.environ['KALDI_ROOT'],
+        'egs/sre08/v1/sid/compute_min_dcf.py'
+    )
+    try:
+        out = subprocess.check_output(
+            [DCF_SCRIPT, '--p-target', str(p_target),
+             scr_f.name, tri_f.name],
+            text=True
+        )
+        dcf = float(out.strip().split()[-1])
+    finally:
+        os.unlink(scr_f.name); os.unlink(tri_f.name)
+    return dcf
+
+def _norm(uid: str) -> str:
+    # 뒤쪽 "-123-400-65" 와 같이 "-숫자-숫자-숫자" 패턴 제거
+    return re.sub(r'-\d+-\d+-\d+$', '', uid)
+
+# ─────────────────────────────────────────────────────────
+def eval_cosine(model, loader, device,
+                trials, writer, step,
+                hvd_rank=0, p_target=0.01):
+    """
+    * 모델을 eval 모드로 두고 valid loader 전체 임베딩 추출
+    * trials( [(utt1, utt2, label)] )에 따라 코사인 스코어 계산
+    * Kaldi compute-eer / compute_min_dcf.py 로 EER·minDCF 산출
+    * TensorBoard 기록 후 EER 반환
+    ----------------------------------------------------------------------
+    Args:
+        model      : nn.Module (x-vector encoder)
+        loader     : DataLoader(valid set)
+        device     : torch.device
+        trials     : List[(utt_id1, utt_id2, int{0,1})]
+        writer     : torch.utils.tensorboard.SummaryWriter
+        step       : global iteration/epoch count
+        hvd_rank   : Horovod/torch.distributed rank (기본 0)
+        p_target   : minDCF 계산용 P_target (디폴트 0.01)
+    """
+    model.eval()
+    emb_cache = {}                       # utt_id -> nd.array(embed)
+    with torch.no_grad():
+        for feats, utt_ids in loader:    # feats: (B, T, F)
+            x = feats.to(device).transpose(1, 2)
+            vecs = model(x).cpu().numpy()
+            for uid_raw, vec in zip(utt_ids, vecs):
+                emb_cache[_norm(uid_raw)] = vec
+
+    # rank 0만 평가 지표 계산 (멀티 GPU일 때)
+    if hvd_rank != 0:
+        return None
+
+    # ── (추가) emb_cache에 실제로 존재하는 utt만 필터 ──────────
+    valid_utts = set(emb_cache)          # 이번 검증에서 forward된 ID
+
+    filtered_pairs = [
+        (_cosine_score(emb_cache[_norm(u1)], emb_cache[_norm(u2)]), lab)
+        for u1, u2, lab in trials
+        if _norm(u1) in valid_utts and _norm(u2) in valid_utts
+    ]
+
+    missing = len(trials) - len(filtered_pairs)
+    if missing and hvd_rank == 0:
+        logger.warning(f"[Cosine] {missing} pairs skipped "
+                       f"(utt not seen in this eval)")
+        
+    logger.info(f"[Cosine] emb_cache={len(emb_cache)}  "
+            f"trial_ids={len(trials)}  "
+            f"matched={len(filtered_pairs)}")
+
+    if not filtered_pairs:               # 모든 쌍이 빠질 일은 드물지만 대비
+        return None
+
+    scores, labels = zip(*filtered_pairs)
+    filtered_trials = [(u1, u2, lab)             # label은 0/1
+                   for (u1, u2, lab), _ in zip(trials, filtered_pairs)]
+
+    # Kaldi 유틸 호출
+    tmpfile = _write_scores_labels(scores, labels)
+    try:
+        eer  = _kaldi_compute_eer(tmpfile)
+        dcf = _kaldi_compute_min_dcf(filtered_trials, scores, p_target)
+    finally:
+        os.unlink(tmpfile.name)          # 임시 파일 삭제
+
+    # TensorBoard 기록
+    writer.add_scalar("EER/cos",    eer, step)
+    writer.add_scalar("minDCF/cos", dcf, step)
+
+    logger.info(f"[Val] step={step:,}  EER={eer*100:.2f}%  minDCF={dcf:.3f}")
+    return eer
 
 def _remove_model(nnet_dir, _iter, preserve_model_interval=100):
     if _iter < 1 or _iter % preserve_model_interval == 0:
@@ -352,6 +621,8 @@ def train(args):
         args: a Namespace object with the required parameters
             obtained from the function process_args()
     """
+    
+    writer = SummaryWriter(log_dir=os.path.join(args.dir, 'tensorboard_logs'))  # TensorBoard writer 초기화
 
     egs_dir = args.egs_dir
     # initialize horovod
@@ -405,14 +676,46 @@ def train(args):
     model = model.to(torch.device(device=device))
 
     parameters = model.parameters()
+    
+    # ── 1) 백본 동결 ────────────────────────────────
+    freeze_prefixes = ('conv1', 'bn1', 'layer1', 'layer2', 'layer3')
 
-    # scale learning rate by the number of GPUs.
+    for name, p in model.named_parameters():
+        # metric·embedding·layer4 만 학습
+        if name.startswith(freeze_prefixes):
+            p.requires_grad = False
+        else:
+            p.requires_grad = True
+            
+    # ── 2) Optimizer에 학습 가능한 파라미터만 전달 ──
+    train_params = [p for p in model.parameters() if p.requires_grad]
+    
+    print("=== Trainable layers ===")
+    for n, p in model.named_parameters():
+        if p.requires_grad:
+            print(n, p.shape)
+
+    # # scale learning rate by the number of GPUs.
+    # if args.optimizer == 'SGD':
+    #     main_optimizer = torch.optim.SGD(parameters, lr=args.initial_effective_lrate * num_jobs,
+    #                                      momentum=args.momentum, weight_decay=args.optimizer_weight_decay,
+    #                                      nesterov=True)
+    #     scheduler = CosineAnnealingWarmRestarts(main_optimizer,
+    #                                     T_0=int(num_archives/num_jobs), T_mult=2)
+    # elif args.optimizer == 'Adam':
+    #     main_optimizer = torch.optim.Adam(parameters, lr=args.initial_effective_lrate * num_jobs,
+    #                                       weight_decay=args.optimizer_weight_decay)
+    # else:
+    #     raise ValueError(f'Invalid optimizer {args.optimizer}.')
+    
     if args.optimizer == 'SGD':
-        main_optimizer = torch.optim.SGD(parameters, lr=args.initial_effective_lrate * num_jobs,
+        main_optimizer = torch.optim.SGD(train_params, lr=args.initial_effective_lrate * num_jobs,
                                          momentum=args.momentum, weight_decay=args.optimizer_weight_decay,
                                          nesterov=True)
+        scheduler = CosineAnnealingWarmRestarts(main_optimizer,
+                                        T_0=int(num_archives/num_jobs), T_mult=2)
     elif args.optimizer == 'Adam':
-        main_optimizer = torch.optim.Adam(parameters, lr=args.initial_effective_lrate * num_jobs,
+        main_optimizer = torch.optim.Adam(train_params, lr=args.initial_effective_lrate * num_jobs,
                                           weight_decay=args.optimizer_weight_decay)
     else:
         raise ValueError(f'Invalid optimizer {args.optimizer}.')
@@ -469,7 +772,7 @@ def train(args):
     # note: here minibatch is the size before
     train_dataset = KaldiArkDataset(egs_dir=egs_dir, num_archives=num_archives, num_workers=num_jobs, rank=hvd.rank(),
                                     num_examples_in_each_ark=arks_num_egs, finished_iterations=finished_iterations,
-                                    processed_archives=processed_archives, apply_cmn=args.apply_cmn)
+                                    processed_archives=processed_archives, apply_cmn=args.apply_cmn, return_utt=False)
 
     # use DistributedSampler to partition the training data.
     train_sampler = torch.utils.data.distributed.DistributedSampler(
@@ -481,12 +784,65 @@ def train(args):
         batch_size=args.minibatch_size, 
         sampler=train_sampler, 
         **kwargs)
+    
+    trials = []
+    with open(args.trials_path) as f:
+        for line in f:
+            u1, u2, lab = line.rstrip().split()
+            trials.append((u1, u2, int(lab)))
+    # val_ark = os.path.join(egs_dir, 'train_diagnostic_egs.1.ark')
+    # val_scp = os.path.join(egs_dir, 'train_diagnostic_egs.1.scp')
+    val_egs_dir = args.val_egs_dir if args.val_egs_dir else args.egs_dir
+    [val_num_archives, val_egs_feat_dim, val_arks_num_egs] = ze_utils.verify_egs_dir(val_egs_dir)
+    
+    val_dataset = FeatsScpDataset(
+        feats_scp="data/all_combined_aug_and_clean_valid/feats.scp",
+        cmn=True
+    )
+    
+    val_loader = torch.utils.data.DataLoader(
+        val_dataset,
+        batch_size=args.minibatch_size,
+        shuffle=False,     # 매번 같은 순서 → 재현성
+        num_workers=8,
+        pin_memory=True,
+        collate_fn=collate_fixed          # ★ 핵심
+    )
+    
+    best_eer = 1.0
+    
+    # val_dataset = KaldiArkDataset(
+    #     egs_dir=val_egs_dir,
+    #     num_archives=val_num_archives,          # ← 파일 개수로 설정
+    #     num_workers=1,
+    #     rank=0,                       # validation 은 분산학습 rank 무관
+    #     num_examples_in_each_ark=val_arks_num_egs,  # 무시돼도 큰 문제 없음
+    #     finished_iterations=0,
+    #     processed_archives=0,
+    #     apply_cmn=args.apply_cmn,
+    #     return_utt=True
+    # )
+    
+    # val_loader = torch.utils.data.DataLoader(
+    #     val_dataset,
+    #     batch_size=args.minibatch_size,
+    #     shuffle=False
+    # )
 
     # (optional) compression algorithm. TODO add better compression method
     compression = hvd.Compression.fp16 if args.fp16_compression else hvd.Compression.none
     #
+    
+    # ── trainable 이름·파라미터만 뽑기 ─────────────────────
+    named_trainables = [
+        (n, p) for n, p in model.named_parameters() if p.requires_grad
+    ]
+    
     # wrap optimizer with DistributedOptimizer.
-    optimizer = hvd.DistributedOptimizer(main_optimizer, named_parameters=model.named_parameters(),
+    # optimizer = hvd.DistributedOptimizer(main_optimizer, named_parameters=model.named_parameters(),
+    #                                      compression=compression)
+    
+    optimizer = hvd.DistributedOptimizer(main_optimizer, named_parameters=named_trainables,
                                          compression=compression)
 
     # broadcast parameters & optimizer state.
@@ -534,9 +890,16 @@ def train(args):
                                               / num_archives_to_process_margin_m) * args.initial_margin_m
             model.metric.m = effective_margin_m
 
-        coeff = num_jobs
-        if _iter < args.warmup_epochs > 0 and num_jobs > 1:
-            coeff = float(_iter) * (num_jobs - 1) / args.warmup_epochs + 1.0
+        # coeff = num_jobs
+        # if _iter < args.warmup_epochs > 0 and num_jobs > 1:
+        #     coeff = float(_iter) * (num_jobs - 1) / args.warmup_epochs + 1.0
+        
+        iters_per_epoch = int(num_archives / num_jobs)
+        warmup_iters = args.warmup_epochs * iters_per_epoch   # 에포크 → iter 환산
+        
+        coeff = 1.0
+        if _iter < warmup_iters and warmup_iters > 0:
+            coeff = float(_iter + 1) / warmup_iters          # 0 → 1 선형 증가
 
         for param_group in optimizer.param_groups:
             param_group['lr'] = effective_learning_rate * coeff
@@ -550,7 +913,7 @@ def train(args):
             else:
                 logger.info(f'Iter: {_iter + 1}/{num_iters}  Epoch: {epoch:0.2f}/{args.num_epochs:0.1f}'
                             f'  ({percent:0.1f}% complete)  lr: {lr:0.5f} margin: {model.metric.m:0.4f}')
-
+                
         train_dataset.set_iteration(_iter + 1)
 
         train_one_iteration(
@@ -563,12 +926,35 @@ def train(args):
             criterion=criterion,
             device=device,
             log_interval=500,
-            len_train_sampler=len(train_sampler))
+            len_train_sampler=len(train_sampler),
+            writer=writer)
+                    
+        # if (_iter + 1) % 5 == 0 and hvd.rank() == 0:  # 5 iter마다 검증
+        # if hvd.rank() == 0:  # TODO : validation 테스트용 
+        #     val_dataset.set_iteration(_iter + 1)            
+        #     v_loss, v_acc = eval_once(model, val_loader, device, criterion)
+        #     writer.add_scalar('Loss/val', v_loss, _iter + 1)
+        #     writer.add_scalar('Accuracy/val',  v_acc,  _iter + 1)
+        #     logger.info(f'Validation  Loss: {v_loss:.4f}  Accuracy: {v_acc*100:.2f}%')
+        if (_iter + 1) % 5 == 0 and hvd.rank() == 0:  # 5 iter마다 검증
+            # val_dataset.set_iteration(_iter + 1)
+            eer = eval_cosine(
+                model, val_loader, device,
+                trials, writer, _iter + 1,
+                hvd_rank=hvd.rank() if hvd else 0
+            )
+            if hvd.rank() == 0 and eer is not None and eer < best_eer:
+                best_eer = eer
+                torch.save(model.state_dict(), os.path.join(args.dir, 'models', 'model_best.pth'))
+                
+        if _iter >= warmup_iters:
+            scheduler.step()
 
         if args.cleanup and hvd.rank() == 0:
             # do a clean up everything but the last 2 models, under certain conditions
             _remove_model(args.dir, _iter - 2, args.preserve_model_interval)
-
+            
+    
     if hvd.rank() == 0:
         ze_utils.force_symlink(f'raw_{num_iters}.pth', os.path.join(args.dir, 'models', 'model_final'))
 
@@ -576,6 +962,8 @@ def train(args):
         logger.info(f'Cleaning up the experiment directory {args.dir}')
         for _iter in range(num_iters - 2):
             _remove_model(args.dir, _iter, args.preserve_model_interval)
+            
+    writer.close()  # TensorBoard writer 닫기
 
 
 if __name__ == '__main__':

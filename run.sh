@@ -25,31 +25,41 @@ rate=16k
 all_data_dir=all_combined
 
 # set directory for corresponding datasets
-voxceleb1_path=
+voxceleb1_path=data/voxceleb1
 voxceleb2_dev_path=
 voxceleb_cn_path=
-export musan_dir=
+refined_to_train_500h_path=data/refined_to_train_500h
+export musan_dir='data/musan'
 
 
 if [ ${stage} -le 1 ]; then
   # prepare voxceleb1, voxceleb2 dev data and voxceleb-cn
   # parameter --remove-speakers removes test speakers from voxceleb1
   # please see script utils/make_data_dir_from_voxceleb.py to adapt it to your needs
-  python utils/make_data_dir_from_voxceleb.py --out-data-dir data/voxceleb1 \
-    --dataset-name voxceleb1 --remove-speakers local/voxceleb1-test_speakers.txt \
-    --dataset-path ${voxceleb1_path} --rate ${rate}
-  utils/fix_data_dir.sh data/voxceleb1
-  python utils/make_data_dir_from_voxceleb.py --out-data-dir data/voxceleb2 \
-    --dataset-name voxceleb2 --format raw --rate ${rate} \
-    --dataset-path ${voxceleb2_dev_path} 
-  utils/fix_data_dir.sh data/voxceleb2
-  python utils/make_data_dir_from_voxceleb.py --out-data-dir data/voxcelebcn \
-    --dataset-name voxcelebcn --no-links --rate ${rate} \
-    --dataset-path ${voxceleb_cn_path}
-  utils/fix_data_dir.sh data/voxcelebcn
+#   python utils/make_data_dir_from_voxceleb.py --out-data-dir data/voxceleb1 \
+#     --dataset-name voxceleb1 --remove-speakers local/voxceleb1-test_speakers.txt \
+#     --dataset-path ${voxceleb1_path} --rate ${rate}
+#   utils/fix_data_dir.sh data/voxceleb1
+#   python utils/make_data_dir_from_voxceleb.py --out-data-dir data/voxceleb2 \
+#     --dataset-name voxceleb2 --format raw --rate ${rate} \
+#     --dataset-path ${voxceleb2_dev_path} 
+#   utils/fix_data_dir.sh data/voxceleb2
+#   python utils/make_data_dir_from_voxceleb.py --out-data-dir data/voxcelebcn \
+#     --dataset-name voxcelebcn --no-links --rate ${rate} \
+#     --dataset-path ${voxceleb_cn_path}
+#   utils/fix_data_dir.sh data/voxcelebcn
+  python utils/make_data_dir_from_voxceleb.py --out-data-dir ${voxceleb1_path} \
+    --dataset-name voxceleb1 --rate ${rate} --format wav \
+    --dataset-path ${voxceleb1_path}/wav
+  utils/fix_data_dir.sh ${voxceleb1_path}
+  python utils/make_data_dir_from_voxceleb.py --out-data-dir ${refined_to_train_500h_path} \
+    --dataset-name refined_to_train_500h --rate ${rate} --format wav \
+    --dataset-path ${refined_to_train_500h_path}/kaldi_style_segments_max_20
+  utils/fix_data_dir.sh ${refined_to_train_500h_path}
 
   # combine all data into one data directory
-  utils/combine_data.sh data/${all_data_dir} data/voxceleb1 data/voxceleb2 data/voxcelebcn
+#   utils/combine_data.sh data/${all_data_dir} data/voxceleb1 data/voxceleb2 data/voxcelebcn
+    utils/combine_data.sh data/${all_data_dir} ${voxceleb1_path} ${refined_to_train_500h_path}
 fi
 
 
@@ -116,9 +126,62 @@ if [ ${stage} -le 3 ]; then
   utils/fix_data_dir.sh data/${name}_with_aug_no_sil
 fi
 
+if [ ${stage} -le 3 ]; then
+  # 화자 리스트에서 10% 무작위 선택 → validation
+  valid_spk_pct=10                     # 필요하면 조정
+  spk_list=data/${name}_with_aug_no_sil/spk2utt
+  num_valid_spk=$(( $(wc -l < ${spk_list}) * valid_spk_pct / 100 ))
+
+  mkdir -p lists
+  awk '{print $1}' ${spk_list} | shuf -n ${num_valid_spk} > lists/valid_spk.list
+
+  # validation 디렉터리
+  utils/subset_data_dir.sh --spk-list lists/valid_spk.list \
+        data/${name}_with_aug_no_sil  data/${name}_valid
+
+  utils/fix_data_dir.sh data/${name}_valid
+
+  utils/copy_data_dir.sh data/${name}_with_aug_no_sil  data/${name}_train
+
+  grep -v -f lists/valid_spk.list data/${name}_with_aug_no_sil/spk2utt | \
+    awk '{print $1}' > lists/train_spk.list
+
+  utils/filter_scp.pl lists/train_spk.list \
+      data/${name}_with_aug_no_sil/spk2utt | \
+    awk '{for(i=2;i<=NF;i++) print $i}' > lists/train_utt.list   # 발화ID 추출
+
+  # utt2spk · 나머지 per-utt 파일 필터
+  for f in utt2spk feats.scp vad.scp wav.scp utt2num_frames; do
+    utils/filter_scp.pl lists/train_utt.list \
+          data/${name}_train/${f} > data/${name}_train/${f}.new
+    mv data/${name}_train/${f}.new data/${name}_train/${f}
+  done
+
+  # spk2utt 재생성
+  utils/utt2spk_to_spk2utt.pl data/${name}_train/utt2spk > \
+        data/${name}_train/spk2utt
+ 
+  utils/fix_data_dir.sh data/${name}_train
+fi
+
+
+# if [ ${stage} -le 4 ]; then
+#   echo "$0: Getting neural network training egs";
+#   local/nnet3/xvector/get_egs_but.sh --cmd "$train_cmd" \
+#     --nj 16 \
+#     --stage 0 \
+#     --frames-per-chunk 400 \
+#     --not-used-frames-percentage 40 \
+#     --num-archives 1000 \
+#     --num-diagnostic-archives 1 \
+#     --num-repeats 10 \
+#     data/${name}_with_aug_no_sil exp/egs
+# fi
 
 if [ ${stage} -le 4 ]; then
-  echo "$0: Getting neural network training egs";
+  echo "$0: Getting neural network training egs (train/valid)"
+
+  # ------------------ 학습용 egs ------------------
   local/nnet3/xvector/get_egs_but.sh --cmd "$train_cmd" \
     --nj 16 \
     --stage 0 \
@@ -127,14 +190,59 @@ if [ ${stage} -le 4 ]; then
     --num-archives 1000 \
     --num-diagnostic-archives 1 \
     --num-repeats 10 \
-    data/${name}_with_aug_no_sil exp/egs
+    data/${name}_train  exp/egs_train
+
+  # ------------------ 검증용 egs ------------------
+  #   스피커 독립성이 이미 확보됐으므로 held-out 옵션은 불필요
+  local/nnet3/xvector/get_egs_but.sh --cmd "$train_cmd" \
+    --nj 4 \
+    --stage 0 \
+    --frames-per-chunk 400 \
+    --not-used-frames-percentage 0 \
+    --num-heldout-utts 3000 \
+    --num-archives 20 \
+    --num-diagnostic-archives 1 \
+    --num-repeats 1 \
+    data/${name}_valid  exp/egs_valid
+
+    echo "$0: Generating spk2int (speaker-to-integer mapping)"
+
+  for split in train valid; do
+    data_dir=data/${name}_${split}         # ex) data/all_combined_aug_and_clean_train
+    egs_dir=exp/egs_${split}               # ex) exp/egs_train
+
+    mkdir -p ${egs_dir}/info
+
+    # ── spk2int 생성 ─────────────────────────────────────────────
+    awk '{print $2}' ${data_dir}/utt2spk | sort -u | nl -v0 -w1 -s' ' \
+        > ${egs_dir}/info/spk2int
+    # ────────────────────────────────────────────────────────────
+
+    n_spk=$(wc -l < ${egs_dir}/info/spk2int)
+    echo "  -> ${egs_dir}/info/spk2int (speakers = ${n_spk})"
+  done
+
+  awk '{print $1}' exp/egs_valid/temp/utt2int.valid > lists/used_utts.list
+
+  # python utils/make_cosine_trials.py \
+  # --utt2spk   data/${name}_valid/utt2spk \
+  # --utt-list  exp/egs_valid/temp/utt2num_frames.valid \
+  # --out-dir   data/${name}_valid \
+  # --anchor-per-spk 5  --neg-per-spk 20
+
+  python utils/make_cosine_trials.py \
+  --utt2spk  data/${name}_valid/utt2spk \
+  --utt-list lists/used_utts.list \
+  --out-dir  data/${name}_valid \
+  --anchor-per-spk 5 --neg-per-spk 20
 fi
 
-num_gpus=2
+num_gpus=1
 if [ ${stage} -le 5 ]; then
   # set all needed parameters in train.sh script
   # this will start NN training
-  ./train.sh /media/ssd-local/profant/exp/egs exp/nnet
+  # ./train.sh exp/egs exp/nnet
+  ./train.sh exp/egs_train exp/egs_valid exp/nnet
 
   # convert pytoch model to onnx (much faster)
   # if this end with error it should be fine, just check if onnx file is present
@@ -146,8 +254,10 @@ if [ ${stage} -le 6 ]; then
   # create data directory for training of PLDA
   # randomly pick one only clean or augmented utterance
   mkdir -p data/plda_train
-  cp data/${name}_with_aug_no_sil/* data/plda_train
-  python local/create_plda_train_dir.py --input-data-dir data/${name}_with_aug_no_sil --output-data-dir data/plda_train
+  # cp data/${name}_with_aug_no_sil/* data/plda_train
+  # python local/create_plda_train_dir.py --input-data-dir data/${name}_with_aug_no_sil --output-data-dir data/plda_train
+  cp data/${name}_train/* data/plda_train
+  python local/create_plda_train_dir.py --input-data-dir data/${name}_train --output-data-dir data/plda_train
   utils/fix_data_dir.sh data/plda_train
 
   # split plda_train data dir to how many gpus you are gonna use for extraction
@@ -164,6 +274,18 @@ if [ ${stage} -le 6 ]; then
       --gpus ${i} &
   done
   wait
+  for d in exp/xvectors_plda_train_*; do
+    echo "Converting $d"
+    for f in $d/xvector.*.txt; do
+      base=$(basename "$f" .txt)          # ex) xvector.0
+      copy-vector ark,t:"$f" ark,scp:"$d/${base}.ark","$d/${base}.scp"
+    done
+  done
+  mkdir -p exp/xvectors_plda_train
+  # 모든 scp를 합쳐 하나로
+  for d in exp/xvectors_plda_train_*; do
+    cat $d/xvector.*.scp
+  done > exp/xvectors_plda_train/xvector.scp
 fi
 
 

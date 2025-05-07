@@ -207,7 +207,7 @@ class KaldiArkLoader(object):
 
 class KaldiArkDataset(Dataset):
     def __init__(self, egs_dir, num_archives, num_workers, rank, num_examples_in_each_ark, apply_cmn,
-                 finished_iterations=0, processed_archives=0, prefix=''):
+                 finished_iterations=0, processed_archives=0, prefix='', return_utt=False):
         super(KaldiArkDataset, self).__init__()
         self.data_loader = None
         self.egs_dir = egs_dir
@@ -220,11 +220,19 @@ class KaldiArkDataset(Dataset):
         self.num_examples_in_each_ark = num_examples_in_each_ark
         self.length = num_workers * num_examples_in_each_ark
         self.prefix = prefix
+        self.return_utt = return_utt   # ★ 추가
 
+    # def __getitem__(self, idx):
+    #     # read the next example from the corresponding loader
+    #     mat, spk_id, utt_id = self.data_loader.next()
+    #     return mat, spk_id
+    
     def __getitem__(self, idx):
-        # read the next example from the corresponding loader
-        mat, spk_id, name = self.data_loader.next()
-        return mat, spk_id
+        mat, spk_id, utt_id = self.data_loader.next()  # name → utt_id
+        if self.return_utt:
+            return mat, utt_id        # ← 검증용: (특징, 발화ID)
+        else:
+            return mat, spk_id        # ← 학습용: (특징, 정수 라벨)
 
     def __len__(self):
         return self.length

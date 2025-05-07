@@ -181,17 +181,32 @@ def get_labels(utt2int_filename):
 
 
 def get_random_chunk_without_replacement(spk, spk2chunk, spk2utt, utt2len, spk2start_idx, frames_per_chunk):
-    spk_chunks = spk2chunk[spk]
-    spk_num_chunks = len(spk_chunks)
-    if spk_num_chunks <= 1:
+    # spk_chunks = spk2chunk[spk]
+    # spk_num_chunks = len(spk_chunks)
+    # if spk_num_chunks <= 1:
+    #     chunks = gen_spk_chunks(spk, spk2utt[spk], utt2len, spk2start_idx, frames_per_chunk)
+    #     if len(chunks) > 0:
+    #         # first shuffle the chunks.
+    #         random.shuffle(chunks)
+    #         spk2chunk[spk] = chunks
+    # i = random.randint(0, spk_num_chunks - 1)
+    # chunk = spk_chunks.pop(i)
+    # return chunk
+    spk_chunks = spk2chunk.get(spk, [])
+    # 만약 chunk가 거의 다 소진되었으면 새로 생성
+    if len(spk_chunks) <= 1:
         chunks = gen_spk_chunks(spk, spk2utt[spk], utt2len, spk2start_idx, frames_per_chunk)
-        if len(chunks) > 0:
-            # first shuffle the chunks.
+        if chunks:
             random.shuffle(chunks)
             spk2chunk[spk] = chunks
-    i = random.randint(0, spk_num_chunks - 1)
-    chunk = spk_chunks.pop(i)
-    return chunk
+            spk_chunks = chunks
+
+    # 여전히 chunk가 없다면 예외를 던져 상위 while-loop가 다른 spk로 넘어가게 한다.
+    if len(spk_chunks) == 0:
+        raise RuntimeError(f"No available chunks for spk {spk}")
+
+    i = random.randint(0, len(spk_chunks) - 1)
+    return spk_chunks.pop(i)
 
 
 # given an utterance length utt_length (in frames) and two desired chunk lengths
@@ -282,17 +297,25 @@ def splitting(args, spk2utt, utt2spk, utt2len, prefix):
             if len(speakers) == 0:
                 print("Ran out of speakers for archive {0}".format(archive_index))
                 break
+            # _flag = True
+            # while _flag:
             _flag = True
+            try_cnt = 0
             while _flag:
                 try:
                     spk = speakers.pop()
                     chunk = get_random_chunk_without_replacement(spk, spk2chunks, spk2utt, utt2len, spk2start_idx,
                                                                  frames_per_chunk)
                     _flag = False
+                # except Exception as exp:
+                #     if archive_index > 85:
+                #         print(exp)
+                #     pass
                 except Exception as exp:
-                    if archive_index > 85:
-                        print(exp)
-                    pass
+                    try_cnt += 1
+                    if try_cnt > len(spk2chunks):   # 화자 수만큼 시도했는데도 실패 → 루프 탈출
+                        break
+                    continue
             this_egs.append(chunk)
             spk2used_chunks[spk] += 1
             ark_num_egs += 1
